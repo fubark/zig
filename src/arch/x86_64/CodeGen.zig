@@ -275,7 +275,9 @@ pub fn generate(
         .stack_align = undefined,
         .end_di_line = module_fn.rbrace_line,
         .end_di_column = module_fn.rbrace_column,
-        .mir_to_air_map = if (builtin.mode == .Debug) std.AutoHashMap(Mir.Inst.Index, Air.Inst.Index).init(bin_file.allocator) else {},
+        .mir_to_air_map = if (builtin.mode == .Debug)
+            std.AutoHashMap(Mir.Inst.Index, Air.Inst.Index).init(bin_file.allocator)
+        else {},
     };
     defer function.stack.deinit(bin_file.allocator);
     defer function.blocks.deinit(bin_file.allocator);
@@ -386,8 +388,8 @@ fn gen(self: *Self) InnerError!void {
         _ = try self.addInst(.{
             .tag = .mov,
             .ops = (Mir.Ops{
-                .reg1 = .rsp,
-                .reg2 = .rbp,
+                .reg1 = .rbp,
+                .reg2 = .rsp,
             }).encode(),
             .data = undefined,
         });

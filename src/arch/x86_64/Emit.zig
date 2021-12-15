@@ -608,7 +608,6 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
         0b00 => blk: {
             if (ops.reg2 == .none) {
                 // OP reg1, imm32
-                // OP r/m64, imm32
                 const imm = emit.mir.instructions.items(.data)[inst].imm;
                 const opcode = getArithOpCode(tag, .mi);
                 const encoder = try Encoder.init(emit.code, 7);
@@ -628,17 +627,16 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
                 break :blk;
             }
             // OP reg1, reg2
-            // OP r/m64, r64
             const opcode = getArithOpCode(tag, .mr);
             const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
             const encoder = try Encoder.init(emit.code, 3);
             encoder.rex(.{
                 .w = ops.reg1.size() == 64 and ops.reg2.size() == 64,
-                .r = ops.reg1.isExtended(),
-                .b = ops.reg2.isExtended(),
+                .r = ops.reg2.isExtended(),
+                .b = ops.reg1.isExtended(),
             });
             encoder.opcode_1byte(opc);
-            encoder.modRm_direct(ops.reg1.lowId(), ops.reg2.lowId());
+            encoder.modRm_direct(ops.reg2.lowId(), ops.reg1.lowId());
         },
         0b01 => blk: {
             const imm = emit.mir.instructions.items(.data)[inst].imm;
