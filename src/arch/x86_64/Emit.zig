@@ -59,6 +59,20 @@ const Reloc = struct {
     length: u5,
 };
 
+const EmitResult = union(enum) {
+    ok: void,
+    err: *ErrorMsg,
+
+    fn deinit(self: *EmitResult, allocator: Allocator) void {
+        switch (self.*) {
+            .ok => {},
+            .err => |err_msg| {
+                err_msg.destroy(allocator);
+            },
+        }
+    }
+};
+
 pub fn emitMir(emit: *Emit) InnerError!void {
     const mir_tags = emit.mir.instructions.items(.tag);
 
@@ -163,8 +177,14 @@ pub fn deinit(emit: *Emit) void {
 
 fn fail(emit: *Emit, comptime format: []const u8, args: anytype) InnerError {
     @setCold(true);
+    const err_msg = try ErrorMsg.create(emit.bin_file.allocator, emit.src_loc, format, args);
+    return emit.failWithErrorMsg(err_msg);
+}
+
+fn failWithErrorMsg(emit: *Emit, err_msg: *ErrorMsg) InnerError {
+    @setCold(true);
     assert(emit.err_msg == null);
-    emit.err_msg = try ErrorMsg.create(emit.bin_file.allocator, emit.src_loc, format, args);
+    emit.err_msg = err_msg;
     return error.EmitFail;
 }
 
@@ -841,16 +861,32 @@ fn mirArithScaleImm(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerE
 }
 
 fn mirMov(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!void {
-    return mirMovImpl(emit.mir.instructions, emit.mir.extra, tag, inst, emit.code);
+    const res = mirMovImpl(
+        emit.bin_file.allocator,
+        emit.mir.instructions,
+        emit.mir.extra,
+        tag,
+        inst,
+        emit.src_loc,
+        emit.code,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return emit.fail("emit failed with error: {}", .{err}),
+    };
+    switch (res) {
+        .ok => {},
+        .err => |err_msg| return emit.failWithErrorMsg(err_msg),
+    }
 }
 
 fn mirMovImpl(
+    allocator: Allocator,
     mir_instructions: std.MultiArrayList(Mir.Inst).Slice,
     mir_extra: []const u32,
     tag: Mir.Inst.Tag,
     inst: Mir.Inst.Index,
+    src_loc: Module.SrcLoc,
     code: *std.ArrayList(u8),
-) InnerError!void {
+) error{OutOfMemory}!EmitResult {
     const ops = Mir.Ops.decode(mir_instructions.items(.ops)[inst]);
     switch (ops.flags) {
         0b00 => blk: {
@@ -878,6 +914,14 @@ fn mirMovImpl(
             }
             // mov reg1, reg2
             // MR
+            if (ops.reg1.size() != ops.reg2.size()) {
+                return EmitResult{
+                    .err = try ErrorMsg.create(allocator, src_loc, "size mismatch: {} != {}", .{
+                        ops.reg1,
+                        ops.reg2,
+                    }),
+                };
+            }
             const opc: u8 = if (ops.reg1.size() == 8) 0x88 else 0x89;
             const encoder = try Encoder.init(code, 3);
             encoder.rex(.{
@@ -1001,6 +1045,8 @@ fn mirMovImpl(
             encoder.modRm_direct(ops.reg1.lowId(), ops.reg2.lowId());
         },
     }
+
+    return EmitResult{ .ok = .{} };
 }
 
 fn mirMovabs(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
@@ -1419,26 +1465,59 @@ fn expectEqualHexStrings(expected: []const u8, given: []const u8, assembly: []co
     });
 }
 
-fn testEmitSingle(mir_inst: Mir.Inst, expected_enc: []const u8, assembly: []const u8) !void {
+fn testEmitSingleSuccess(mir_inst: Mir.Inst, expected_enc: []const u8, assembly: []const u8) !void {
     var mock = Mock.init();
     defer mock.deinit();
     const index = try mock.addInst(mir_inst);
-    switch (mir_inst.tag) {
+    var res = switch (mir_inst.tag) {
         .mov => try mirMovImpl(
+            testing.allocator,
             mock.mir_instructions.slice(),
             mock.mir_extra.items,
             mir_inst.tag,
             index,
+            Module.SrcLoc{
+                .file_scope = undefined,
+                .parent_decl_node = 0,
+                .lazy = .unneeded,
+            },
             &mock.code,
         ),
         else => unreachable,
-    }
+    };
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
     try testing.expect(mock.code.items.len == expected_enc.len);
     try expectEqualHexStrings(expected_enc, mock.code.items, assembly);
 }
 
+fn testEmitSingleFail(mir_inst: Mir.Inst, err_msg: []const u8) !void {
+    var mock = Mock.init();
+    defer mock.deinit();
+    const index = try mock.addInst(mir_inst);
+    var res = switch (mir_inst.tag) {
+        .mov => try mirMovImpl(
+            testing.allocator,
+            mock.mir_instructions.slice(),
+            mock.mir_extra.items,
+            mir_inst.tag,
+            index,
+            Module.SrcLoc{
+                .file_scope = undefined,
+                .parent_decl_node = 0,
+                .lazy = .unneeded,
+            },
+            &mock.code,
+        ),
+        else => unreachable,
+    };
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .err);
+    try testing.expectEqualStrings(err_msg, res.err.msg);
+}
+
 test "mov dst_reg, src_reg" {
-    try testEmitSingle(.{
+    try testEmitSingleSuccess(.{
         .tag = .mov,
         .ops = (Mir.Ops{
             .reg1 = .rbp,
@@ -1447,7 +1526,7 @@ test "mov dst_reg, src_reg" {
         .data = undefined,
     }, "\x48\x89\xe5", "mov rbp, rsp");
 
-    try testEmitSingle(.{
+    try testEmitSingleSuccess(.{
         .tag = .mov,
         .ops = (Mir.Ops{
             .reg1 = .r12,
@@ -1456,25 +1535,25 @@ test "mov dst_reg, src_reg" {
         .data = undefined,
     }, "\x49\x89\xc4", "mov r12, rax");
 
-    try testEmitSingle(.{
+    try testEmitSingleFail(.{
         .tag = .mov,
         .ops = (Mir.Ops{
             .reg1 = .r12,
             .reg2 = .eax,
         }).encode(),
         .data = undefined,
-    }, "\x49\x89\xc4", "mov r12, eax");
+    }, "size mismatch: Register.r12 != Register.eax");
 
-    try testEmitSingle(.{
+    try testEmitSingleFail(.{
         .tag = .mov,
         .ops = (Mir.Ops{
             .reg1 = .r12d,
             .reg2 = .rax,
         }).encode(),
         .data = undefined,
-    }, "\x49\x89\xc4", "mov r12d, rax");
+    }, "size mismatch: Register.r12d != Register.rax");
 
-    try testEmitSingle(.{
+    try testEmitSingleSuccess(.{
         .tag = .mov,
         .ops = (Mir.Ops{
             .reg1 = .r12d,
@@ -1484,7 +1563,7 @@ test "mov dst_reg, src_reg" {
     }, "\x41\x89\xc4", "mov r12d, eax");
 
     // TODO mov r12b, ah requires a codepath without REX prefix
-    try testEmitSingle(.{
+    try testEmitSingleSuccess(.{
         .tag = .mov,
         .ops = (Mir.Ops{
             .reg1 = .r12b,
