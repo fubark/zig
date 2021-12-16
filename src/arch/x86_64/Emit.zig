@@ -102,10 +102,7 @@ pub fn emitMir(emit: *Emit) InnerError!void {
             .sbb_scale_imm => try emit.mirArithScaleImm(.sbb, inst),
             .cmp_scale_imm => try emit.mirArithScaleImm(.cmp, inst),
 
-            // Even though MOV is technically not an arithmetic op,
-            // its structure can be represented using the same set of
-            // opcode primitives.
-            .mov => try emit.mirArith(.mov, inst),
+            .mov => try emit.mirMov(.mov, inst),
             .mov_scale_src => try emit.mirArithScaleSrc(.mov, inst),
             .mov_scale_dst => try emit.mirArithScaleDst(.mov, inst),
             .mov_scale_imm => try emit.mirArithScaleImm(.mov, inst),
@@ -568,7 +565,6 @@ inline fn getArithOpCode(tag: Mir.Inst.Tag, enc: EncType) OpCode {
             .@"or" => .{ .opc = 0x81, .modrm_ext = 0x1 },
             .sbb => .{ .opc = 0x81, .modrm_ext = 0x3 },
             .cmp => .{ .opc = 0x81, .modrm_ext = 0x7 },
-            .mov => .{ .opc = 0xc7, .modrm_ext = 0x0 },
             else => unreachable,
         },
         .mr => {
@@ -581,7 +577,6 @@ inline fn getArithOpCode(tag: Mir.Inst.Tag, enc: EncType) OpCode {
                 .@"or" => 0x09,
                 .sbb => 0x19,
                 .cmp => 0x39,
-                .mov => 0x89,
                 else => unreachable,
             };
             return .{ .opc = opc, .modrm_ext = undefined };
@@ -596,7 +591,6 @@ inline fn getArithOpCode(tag: Mir.Inst.Tag, enc: EncType) OpCode {
                 .@"or" => 0x0b,
                 .sbb => 0x1b,
                 .cmp => 0x3b,
-                .mov => 0x8b,
                 else => unreachable,
             };
             return .{ .opc = opc, .modrm_ext = undefined };
@@ -724,41 +718,26 @@ fn mirArithImpl(
                 encoder.disp32(imm);
             }
         },
-        0b11 => blk: {
-            if (ops.reg2 == .none) {
-                // OP [reg1 + imm32], imm32
-                const payload = mir_instructions.items(.data)[inst].payload;
-                const imm_pair = Mir.extraData(mir_extra, Mir.ImmPair, payload).data;
-                const opcode = getArithOpCode(tag, .mi);
-                const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
-                const encoder = try Encoder.init(code, 11);
-                encoder.rex(.{
-                    .w = false,
-                    .b = ops.reg1.isExtended(),
-                });
-                encoder.opcode_1byte(opc);
-                if (imm_pair.dest_off <= math.maxInt(i8)) {
-                    encoder.modRm_indirectDisp8(opcode.modrm_ext, ops.reg1.lowId());
-                    encoder.disp8(@intCast(i8, imm_pair.dest_off));
-                } else {
-                    encoder.modRm_indirectDisp32(opcode.modrm_ext, ops.reg1.lowId());
-                    encoder.disp32(imm_pair.dest_off);
-                }
-                encoder.imm32(imm_pair.operand);
-                break :blk;
-            }
-            // TODO clearly mov doesn't belong here; for other, arithemtic ops,
-            // this is the same as 0b00.
-            const opcode = getArithOpCode(tag, if (tag == .mov) .rm else .mr);
+        0b11 => {
+            // OP [reg1 + imm32], imm32
+            const payload = mir_instructions.items(.data)[inst].payload;
+            const imm_pair = Mir.extraData(mir_extra, Mir.ImmPair, payload).data;
+            const opcode = getArithOpCode(tag, .mi);
             const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
-            const encoder = try Encoder.init(code, 3);
+            const encoder = try Encoder.init(code, 11);
             encoder.rex(.{
-                .w = ops.reg1.size() == 64 and ops.reg2.size() == 64,
-                .r = ops.reg1.isExtended(),
-                .b = ops.reg2.isExtended(),
+                .w = false,
+                .b = ops.reg1.isExtended(),
             });
             encoder.opcode_1byte(opc);
-            encoder.modRm_direct(ops.reg1.lowId(), ops.reg2.lowId());
+            if (imm_pair.dest_off <= math.maxInt(i8)) {
+                encoder.modRm_indirectDisp8(opcode.modrm_ext, ops.reg1.lowId());
+                encoder.disp8(@intCast(i8, imm_pair.dest_off));
+            } else {
+                encoder.modRm_indirectDisp32(opcode.modrm_ext, ops.reg1.lowId());
+                encoder.disp32(imm_pair.dest_off);
+            }
+            encoder.imm32(imm_pair.operand);
         },
     }
 }
@@ -859,6 +838,169 @@ fn mirArithScaleImm(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerE
         encoder.disp32(imm_pair.dest_off);
     }
     encoder.imm32(imm_pair.operand);
+}
+
+fn mirMov(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!void {
+    return mirMovImpl(emit.mir.instructions, emit.mir.extra, tag, inst, emit.code);
+}
+
+fn mirMovImpl(
+    mir_instructions: std.MultiArrayList(Mir.Inst).Slice,
+    mir_extra: []const u32,
+    tag: Mir.Inst.Tag,
+    inst: Mir.Inst.Index,
+    code: *std.ArrayList(u8),
+) InnerError!void {
+    const ops = Mir.Ops.decode(mir_instructions.items(.ops)[inst]);
+    switch (ops.flags) {
+        0b00 => blk: {
+            if (ops.reg2 == .none) {
+                // mov reg1, imm32
+                // MI
+                const imm = mir_instructions.items(.data)[inst].imm;
+                const opc: u8 = 0xc7;
+                const modrm_ext: u3 = 0x0;
+                const encoder = try Encoder.init(code, 7);
+                encoder.rex(.{
+                    .w = ops.reg1.size() == 64,
+                    .b = ops.reg1.isExtended(),
+                });
+                if (tag != .mov and imm <= math.maxInt(i8)) {
+                    encoder.opcode_1byte(opc + 2);
+                    encoder.modRm_direct(modrm_ext, ops.reg1.lowId());
+                    encoder.imm8(@intCast(i8, imm));
+                } else {
+                    encoder.opcode_1byte(opc);
+                    encoder.modRm_direct(modrm_ext, ops.reg1.lowId());
+                    encoder.imm32(imm);
+                }
+                break :blk;
+            }
+            // mov reg1, reg2
+            // MR
+            const opc: u8 = if (ops.reg1.size() == 8) 0x88 else 0x89;
+            const encoder = try Encoder.init(code, 3);
+            encoder.rex(.{
+                .w = ops.reg1.size() == 64 and ops.reg2.size() == 64,
+                .r = ops.reg2.isExtended(),
+                .b = ops.reg1.isExtended(),
+            });
+            encoder.opcode_1byte(opc);
+            encoder.modRm_direct(ops.reg2.lowId(), ops.reg1.lowId());
+        },
+        0b01 => blk: {
+            const imm = mir_instructions.items(.data)[inst].imm;
+            const opc: u8 = if (ops.reg1.size() == 8) 0x8a else 0x8b;
+            if (ops.reg2 == .none) {
+                // mov reg1, [imm32]
+                // RM
+                const encoder = try Encoder.init(code, 8);
+                encoder.rex(.{
+                    .w = ops.reg1.size() == 64,
+                    .b = ops.reg1.isExtended(),
+                });
+                encoder.opcode_1byte(opc);
+                encoder.modRm_SIBDisp0(ops.reg1.lowId());
+                encoder.sib_disp32();
+                encoder.disp32(imm);
+                break :blk;
+            }
+            // mov reg1, [reg2 + imm32]
+            // RM
+            const encoder = try Encoder.init(code, 7);
+            encoder.rex(.{
+                .w = ops.reg1.size() == 64,
+                .r = ops.reg1.isExtended(),
+                .b = ops.reg2.isExtended(),
+            });
+            encoder.opcode_1byte(opc);
+            if (imm <= math.maxInt(i8)) {
+                encoder.modRm_indirectDisp8(ops.reg1.lowId(), ops.reg2.lowId());
+                encoder.disp8(@intCast(i8, imm));
+            } else {
+                encoder.modRm_indirectDisp32(ops.reg1.lowId(), ops.reg2.lowId());
+                encoder.disp32(imm);
+            }
+        },
+        0b10 => blk: {
+            if (ops.reg2 == .none) {
+                // mov [reg1 + 0], imm32
+                // MI
+                const imm = mir_instructions.items(.data)[inst].imm;
+                const opc: u8 = if (ops.reg1.size() == 8) 0xc6 else 0xc7;
+                const modrm_ext: u3 = 0x0;
+                const encoder = try Encoder.init(code, 7);
+                encoder.rex(.{
+                    .w = ops.reg1.size() == 64,
+                    .b = ops.reg1.isExtended(),
+                });
+                encoder.opcode_1byte(opc);
+                encoder.modRm_indirectDisp0(modrm_ext, ops.reg1.lowId());
+                if (imm <= math.maxInt(i8)) {
+                    encoder.imm8(@intCast(i8, imm));
+                } else if (imm <= math.maxInt(i16)) {
+                    encoder.imm16(@intCast(i16, imm));
+                } else {
+                    encoder.imm32(imm);
+                }
+                break :blk;
+            }
+            // mov [reg1 + imm32], reg2
+            // MR
+            const imm = mir_instructions.items(.data)[inst].imm;
+            const opc: u8 = if (ops.reg1.size() == 8) 0x88 else 0x89;
+            const encoder = try Encoder.init(code, 7);
+            encoder.rex(.{
+                .w = ops.reg2.size() == 64,
+                .r = ops.reg2.isExtended(),
+                .b = ops.reg1.isExtended(),
+            });
+            encoder.opcode_1byte(opc);
+            if (imm <= math.maxInt(i8)) {
+                encoder.modRm_indirectDisp8(ops.reg2.lowId(), ops.reg1.lowId());
+                encoder.disp8(@intCast(i8, imm));
+            } else {
+                encoder.modRm_indirectDisp32(ops.reg2.lowId(), ops.reg1.lowId());
+                encoder.disp32(imm);
+            }
+        },
+        0b11 => blk: {
+            if (ops.reg2 == .none) {
+                // mov [reg1 + imm32], imm32
+                // MI
+                const payload = mir_instructions.items(.data)[inst].payload;
+                const imm_pair = Mir.extraData(mir_extra, Mir.ImmPair, payload).data;
+                const opc: u8 = if (ops.reg1.size() == 8) 0xc6 else 0xc7;
+                const modrm_ext: u3 = 0x0;
+                const encoder = try Encoder.init(code, 11);
+                encoder.rex(.{
+                    .w = false,
+                    .b = ops.reg1.isExtended(),
+                });
+                encoder.opcode_1byte(opc);
+                if (imm_pair.dest_off <= math.maxInt(i8)) {
+                    encoder.modRm_indirectDisp8(modrm_ext, ops.reg1.lowId());
+                    encoder.disp8(@intCast(i8, imm_pair.dest_off));
+                } else {
+                    encoder.modRm_indirectDisp32(modrm_ext, ops.reg1.lowId());
+                    encoder.disp32(imm_pair.dest_off);
+                }
+                encoder.imm32(imm_pair.operand);
+                break :blk;
+            }
+            // mov reg1, reg2
+            // RM
+            const opc: u8 = if (ops.reg1.size() == 8) 0x8a else 0x8b;
+            const encoder = try Encoder.init(code, 3);
+            encoder.rex(.{
+                .w = ops.reg1.size() == 64 and ops.reg2.size() == 64,
+                .r = ops.reg1.isExtended(),
+                .b = ops.reg2.isExtended(),
+            });
+            encoder.opcode_1byte(opc);
+            encoder.modRm_direct(ops.reg1.lowId(), ops.reg2.lowId());
+        },
+    }
 }
 
 fn mirMovabs(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
@@ -1212,39 +1354,40 @@ fn addDbgInfoTypeReloc(emit: *Emit, ty: Type) !void {
     }
 }
 
-const MirMock = struct {
+const Mock = struct {
     const gpa = testing.allocator;
 
     mir_instructions: std.MultiArrayList(Mir.Inst) = .{},
-    mir_extra: std.ArrayListUnmanaged(u32) = .{},
+    mir_extra: std.ArrayList(u32),
     code: std.ArrayList(u8),
 
-    fn init() MirMock {
+    fn init() Mock {
         return .{
+            .mir_extra = std.ArrayList(u32).init(gpa),
             .code = std.ArrayList(u8).init(gpa),
         };
     }
 
-    fn deinit(self: *MirMock) void {
+    fn deinit(self: *Mock) void {
         self.mir_instructions.deinit(gpa);
-        self.mir_extra.deinit(gpa);
+        self.mir_extra.deinit();
         self.code.deinit();
     }
 
-    fn addInst(self: *MirMock, inst: Mir.Inst) error{OutOfMemory}!Mir.Inst.Index {
+    fn addInst(self: *Mock, inst: Mir.Inst) error{OutOfMemory}!Mir.Inst.Index {
         try self.mir_instructions.ensureUnusedCapacity(gpa, 1);
         const result_index = @intCast(Air.Inst.Index, self.mir_instructions.len);
         self.mir_instructions.appendAssumeCapacity(inst);
         return result_index;
     }
 
-    fn addExtra(self: *MirMock, extra: anytype) Allocator.Error!u32 {
+    fn addExtra(self: *Mock, extra: anytype) Allocator.Error!u32 {
         const fields = std.meta.fields(@TypeOf(extra));
-        try self.mir_extra.ensureUnusedCapacity(gpa, fields.len);
+        try self.mir_extra.ensureUnusedCapacity(fields.len);
         return self.addExtraAssumeCapacity(extra);
     }
 
-    fn addExtraAssumeCapacity(self: *MirMock, extra: anytype) u32 {
+    fn addExtraAssumeCapacity(self: *Mock, extra: anytype) u32 {
         const fields = std.meta.fields(@TypeOf(extra));
         const result = @intCast(u32, self.mir_extra.items.len);
         inline for (fields) |field| {
@@ -1258,74 +1401,150 @@ const MirMock = struct {
     }
 };
 
-test "mov dst_reg, src_reg" {
-    var mir_mock = MirMock.init();
-    defer mir_mock.deinit();
+fn expectEqualHexStrings(expected: []const u8, given: []const u8, assembly: []const u8) !void {
+    if (mem.eql(u8, expected, given)) return;
+    const expected_fmt = try std.fmt.allocPrint(testing.allocator, "{x}", .{std.fmt.fmtSliceHexLower(expected)});
+    defer testing.allocator.free(expected_fmt);
+    const given_fmt = try std.fmt.allocPrint(testing.allocator, "{x}", .{std.fmt.fmtSliceHexLower(given)});
+    defer testing.allocator.free(given_fmt);
+    const idx = mem.indexOfDiff(u8, expected_fmt, given_fmt).?;
+    var padding = try testing.allocator.alloc(u8, idx + 5);
+    defer testing.allocator.free(padding);
+    mem.set(u8, padding, ' ');
+    std.debug.print("\nASM: {s}\nEXP: {s}\nGIV: {s}\n{s}^ -- first differing byte\n", .{
+        assembly,
+        expected_fmt,
+        given_fmt,
+        padding,
+    });
+}
 
-    const index = try mir_mock.addInst(.{
+fn testEmitSingle(mir_inst: Mir.Inst, expected_enc: []const u8, assembly: []const u8) !void {
+    var mock = Mock.init();
+    defer mock.deinit();
+    const index = try mock.addInst(mir_inst);
+    switch (mir_inst.tag) {
+        .mov => try mirMovImpl(
+            mock.mir_instructions.slice(),
+            mock.mir_extra.items,
+            mir_inst.tag,
+            index,
+            &mock.code,
+        ),
+        else => unreachable,
+    }
+    try testing.expect(mock.code.items.len == expected_enc.len);
+    try expectEqualHexStrings(expected_enc, mock.code.items, assembly);
+}
+
+test "mov dst_reg, src_reg" {
+    try testEmitSingle(.{
         .tag = .mov,
         .ops = (Mir.Ops{
             .reg1 = .rbp,
             .reg2 = .rsp,
         }).encode(),
         .data = undefined,
-    });
-    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
-    try testing.expect(mir_mock.code.items.len == 3);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x48, 0x89, 0xe5 }, mir_mock.code.items);
-}
+    }, "\x48\x89\xe5", "mov rbp, rsp");
 
-test "mov dst_reg, [src_reg + imm32]" {
-    var mir_mock = MirMock.init();
-    defer mir_mock.deinit();
-
-    const index = try mir_mock.addInst(.{
+    try testEmitSingle(.{
         .tag = .mov,
         .ops = (Mir.Ops{
-            .reg1 = .r11,
-            .reg2 = .rbp,
-            .flags = 0b01,
-        }).encode(),
-        .data = .{ .imm = 0x10 },
-    });
-    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
-    try testing.expect(mir_mock.code.items.len == 4);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x4c, 0x8b, 0x5d, 0x10 }, mir_mock.code.items);
-}
-
-test "mov [dst_reg + imm32], src_reg" {
-    var mir_mock = MirMock.init();
-    defer mir_mock.deinit();
-
-    const index = try mir_mock.addInst(.{
-        .tag = .mov,
-        .ops = (Mir.Ops{
-            .reg1 = .r11,
-            .reg2 = .rbp,
-            .flags = 0b10,
-        }).encode(),
-        .data = .{ .imm = 0x10 },
-    });
-    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
-    try testing.expect(mir_mock.code.items.len == 4);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x49, 0x89, 0x6b, 0x10 }, mir_mock.code.items);
-}
-
-test "mov dst_reg, [src_reg]" {
-    var mir_mock = MirMock.init();
-    defer mir_mock.deinit();
-
-    const index = try mir_mock.addInst(.{
-        .tag = .mov,
-        .ops = (Mir.Ops{
-            .reg1 = .r11,
-            .reg2 = .rbp,
-            .flags = 0b11,
+            .reg1 = .r12,
+            .reg2 = .rax,
         }).encode(),
         .data = undefined,
-    });
-    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
-    // try testing.expect(mir_mock.code.items.len == 4);
-    std.debug.print("{x}\n", .{std.fmt.fmtSliceHexLower(mir_mock.code.items)});
-    // try testing.expectEqualSlices(u8, &[_]u8{ 0x49, 0x89, 0x6b, 0x10 }, mir_mock.code.items);
+    }, "\x49\x89\xc4", "mov r12, rax");
+
+    try testEmitSingle(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .r12,
+            .reg2 = .eax,
+        }).encode(),
+        .data = undefined,
+    }, "\x49\x89\xc4", "mov r12, eax");
+
+    try testEmitSingle(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .r12d,
+            .reg2 = .rax,
+        }).encode(),
+        .data = undefined,
+    }, "\x49\x89\xc4", "mov r12d, rax");
+
+    try testEmitSingle(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .r12d,
+            .reg2 = .eax,
+        }).encode(),
+        .data = undefined,
+    }, "\x41\x89\xc4", "mov r12d, eax");
+
+    // TODO mov r12b, ah requires a codepath without REX prefix
+    try testEmitSingle(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .r12b,
+            .reg2 = .al,
+        }).encode(),
+        .data = undefined,
+    }, "\x41\x88\xc4", "mov r12b, al");
 }
+
+// test "mov dst_reg, [src_reg + imm32]" {
+//     var mock = Mock.init();
+//     defer mock.deinit();
+
+//     const index = try mock.addInst(.{
+//         .tag = .mov,
+//         .ops = (Mir.Ops{
+//             .reg1 = .r11,
+//             .reg2 = .rbp,
+//             .flags = 0b01,
+//         }).encode(),
+//         .data = .{ .imm = 0x10 },
+//     });
+//     try mirArithImpl(mock.mir_instructions.slice(), mock.mir_extra.items, .mov, index, &mock.code);
+//     try testing.expect(mock.code.items.len == 4);
+//     try testing.expectEqualSlices(u8, "\x4c\x8b\x5d\x10", mock.code.items);
+// }
+
+// test "mov [dst_reg + imm32], src_reg" {
+//     var mock = Mock.init();
+//     defer mock.deinit();
+
+//     const index = try mock.addInst(.{
+//         .tag = .mov,
+//         .ops = (Mir.Ops{
+//             .reg1 = .r11,
+//             .reg2 = .rbp,
+//             .flags = 0b10,
+//         }).encode(),
+//         .data = .{ .imm = 0x10 },
+//     });
+//     try mirArithImpl(mock.mir_instructions.slice(), mock.mir_extra.items, .mov, index, &mock.code);
+//     try testing.expect(mock.code.items.len == 4);
+//     try testing.expectEqualSlices(u8, "\x49\x89\x6b\x10", mock.code.items);
+// }
+
+// test "mov dst_reg, [src_reg]" {
+//     var mir_mock = MirMock.init();
+//     defer mir_mock.deinit();
+
+//     const index = try mir_mock.addInst(.{
+//         .tag = .mov,
+//         .ops = (Mir.Ops{
+//             .reg1 = .r11,
+//             .reg2 = .rbp,
+//             .flags = 0b11,
+//         }).encode(),
+//         .data = undefined,
+//     });
+//     try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
+//     // try testing.expect(mir_mock.code.items.len == 4);
+//     std.debug.print("{x}\n", .{std.fmt.fmtSliceHexLower(mir_mock.code.items)});
+//     // try testing.expectEqualSlices(u8, &[_]u8{ 0x49, 0x89, 0x6b, 0x10 }, mir_mock.code.items);
+// }
