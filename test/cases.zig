@@ -7,13 +7,14 @@ const TestContext = @import("../src/test.zig").TestContext;
 // case applies to only the specified target.
 
 pub fn addCases(ctx: *TestContext) !void {
-    try @import("compile_errors.zig").addCases(ctx);
-    try @import("stage2/cbe.zig").addCases(ctx);
-    try @import("stage2/arm.zig").addCases(ctx);
-    try @import("stage2/aarch64.zig").addCases(ctx);
-    try @import("stage2/llvm.zig").addCases(ctx);
-    try @import("stage2/wasm.zig").addCases(ctx);
-    try @import("stage2/riscv64.zig").addCases(ctx);
-    try @import("stage2/plan9.zig").addCases(ctx);
-    try @import("stage2/x86_64.zig").addCases(ctx);
+    // try @import("compile_errors.zig").addCases(ctx);
+    // try @import("stage2/cbe.zig").addCases(ctx);
+    // try @import("stage2/arm.zig").addCases(ctx);
+    // try @import("stage2/aarch64.zig").addCases(ctx);
+    // try @import("stage2/llvm.zig").addCases(ctx);
+    // try @import("stage2/wasm.zig").addCases(ctx);
+    // try @import("stage2/riscv64.zig").addCases(ctx);
+    // try @import("stage2/plan9.zig").addCases(ctx);
+    // try @import("stage2/x86_64.zig").addCases(ctx);
+    _ = ctx;
 }

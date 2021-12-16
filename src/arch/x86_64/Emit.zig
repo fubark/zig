@@ -11,8 +11,10 @@ const link = @import("../../link.zig");
 const log = std.log.scoped(.codegen);
 const math = std.math;
 const mem = std.mem;
+const testing = std.testing;
 
 const Air = @import("../../Air.zig");
+const Allocator = mem.Allocator;
 const DebugInfoOutput = @import("../../codegen.zig").DebugInfoOutput;
 const DW = std.dwarf;
 const Encoder = bits.Encoder;
@@ -603,14 +605,24 @@ inline fn getArithOpCode(tag: Mir.Inst.Tag, enc: EncType) OpCode {
 }
 
 fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!void {
-    const ops = Mir.Ops.decode(emit.mir.instructions.items(.ops)[inst]);
+    return mirArithImpl(emit.mir.instructions, emit.mir.extra, tag, inst, emit.code);
+}
+
+fn mirArithImpl(
+    mir_instructions: std.MultiArrayList(Mir.Inst).Slice,
+    mir_extra: []const u32,
+    tag: Mir.Inst.Tag,
+    inst: Mir.Inst.Index,
+    code: *std.ArrayList(u8),
+) InnerError!void {
+    const ops = Mir.Ops.decode(mir_instructions.items(.ops)[inst]);
     switch (ops.flags) {
         0b00 => blk: {
             if (ops.reg2 == .none) {
                 // OP reg1, imm32
-                const imm = emit.mir.instructions.items(.data)[inst].imm;
+                const imm = mir_instructions.items(.data)[inst].imm;
                 const opcode = getArithOpCode(tag, .mi);
-                const encoder = try Encoder.init(emit.code, 7);
+                const encoder = try Encoder.init(code, 7);
                 encoder.rex(.{
                     .w = ops.reg1.size() == 64,
                     .b = ops.reg1.isExtended(),
@@ -629,7 +641,7 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
             // OP reg1, reg2
             const opcode = getArithOpCode(tag, .mr);
             const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
-            const encoder = try Encoder.init(emit.code, 3);
+            const encoder = try Encoder.init(code, 3);
             encoder.rex(.{
                 .w = ops.reg1.size() == 64 and ops.reg2.size() == 64,
                 .r = ops.reg2.isExtended(),
@@ -639,13 +651,12 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
             encoder.modRm_direct(ops.reg2.lowId(), ops.reg1.lowId());
         },
         0b01 => blk: {
-            const imm = emit.mir.instructions.items(.data)[inst].imm;
+            const imm = mir_instructions.items(.data)[inst].imm;
             const opcode = getArithOpCode(tag, .rm);
             const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
             if (ops.reg2 == .none) {
                 // OP reg1, [imm32]
-                // OP r64, r/m64
-                const encoder = try Encoder.init(emit.code, 8);
+                const encoder = try Encoder.init(code, 8);
                 encoder.rex(.{
                     .w = ops.reg1.size() == 64,
                     .b = ops.reg1.isExtended(),
@@ -657,8 +668,7 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
                 break :blk;
             }
             // OP reg1, [reg2 + imm32]
-            // OP r64, r/m64
-            const encoder = try Encoder.init(emit.code, 7);
+            const encoder = try Encoder.init(code, 7);
             encoder.rex(.{
                 .w = ops.reg1.size() == 64,
                 .r = ops.reg1.isExtended(),
@@ -676,11 +686,10 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
         0b10 => blk: {
             if (ops.reg2 == .none) {
                 // OP [reg1 + 0], imm32
-                // OP r/m64, imm32
-                const imm = emit.mir.instructions.items(.data)[inst].imm;
+                const imm = mir_instructions.items(.data)[inst].imm;
                 const opcode = getArithOpCode(tag, .mi);
                 const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
-                const encoder = try Encoder.init(emit.code, 7);
+                const encoder = try Encoder.init(code, 7);
                 encoder.rex(.{
                     .w = ops.reg1.size() == 64,
                     .b = ops.reg1.isExtended(),
@@ -697,34 +706,32 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
                 break :blk;
             }
             // OP [reg1 + imm32], reg2
-            // OP r/m64, r64
-            const imm = emit.mir.instructions.items(.data)[inst].imm;
+            const imm = mir_instructions.items(.data)[inst].imm;
             const opcode = getArithOpCode(tag, .mr);
             const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
-            const encoder = try Encoder.init(emit.code, 7);
+            const encoder = try Encoder.init(code, 7);
             encoder.rex(.{
                 .w = ops.reg2.size() == 64,
-                .r = ops.reg1.isExtended(),
-                .b = ops.reg2.isExtended(),
+                .r = ops.reg2.isExtended(),
+                .b = ops.reg1.isExtended(),
             });
             encoder.opcode_1byte(opc);
             if (imm <= math.maxInt(i8)) {
-                encoder.modRm_indirectDisp8(ops.reg1.lowId(), ops.reg2.lowId());
+                encoder.modRm_indirectDisp8(ops.reg2.lowId(), ops.reg1.lowId());
                 encoder.disp8(@intCast(i8, imm));
             } else {
-                encoder.modRm_indirectDisp32(ops.reg1.lowId(), ops.reg2.lowId());
+                encoder.modRm_indirectDisp32(ops.reg2.lowId(), ops.reg1.lowId());
                 encoder.disp32(imm);
             }
         },
         0b11 => blk: {
             if (ops.reg2 == .none) {
                 // OP [reg1 + imm32], imm32
-                // OP r/m64, imm32
-                const payload = emit.mir.instructions.items(.data)[inst].payload;
-                const imm_pair = emit.mir.extraData(Mir.ImmPair, payload).data;
+                const payload = mir_instructions.items(.data)[inst].payload;
+                const imm_pair = Mir.extraData(mir_extra, Mir.ImmPair, payload).data;
                 const opcode = getArithOpCode(tag, .mi);
                 const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
-                const encoder = try Encoder.init(emit.code, 11);
+                const encoder = try Encoder.init(code, 11);
                 encoder.rex(.{
                     .w = false,
                     .b = ops.reg1.isExtended(),
@@ -744,7 +751,7 @@ fn mirArith(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!voi
             // this is the same as 0b00.
             const opcode = getArithOpCode(tag, if (tag == .mov) .rm else .mr);
             const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
-            const encoder = try Encoder.init(emit.code, 3);
+            const encoder = try Encoder.init(code, 3);
             encoder.rex(.{
                 .w = ops.reg1.size() == 64 and ops.reg2.size() == 64,
                 .r = ops.reg1.isExtended(),
@@ -833,7 +840,7 @@ fn mirArithScaleImm(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerE
     const ops = Mir.Ops.decode(emit.mir.instructions.items(.ops)[inst]);
     const scale = ops.flags;
     const payload = emit.mir.instructions.items(.data)[inst].payload;
-    const imm_pair = emit.mir.extraData(Mir.ImmPair, payload).data;
+    const imm_pair = Mir.extraData(emit.mir.extra, Mir.ImmPair, payload).data;
     const opcode = getArithOpCode(tag, .mi);
     const opc = if (ops.reg1.size() == 8) opcode.opc - 1 else opcode.opc;
     const encoder = try Encoder.init(emit.code, 2);
@@ -895,7 +902,7 @@ fn mirMovabs(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
 
     if (is_64) {
         const payload = emit.mir.instructions.items(.data)[inst].payload;
-        const imm64 = emit.mir.extraData(Mir.Imm64, payload).data;
+        const imm64 = Mir.extraData(emit.mir.extra, Mir.Imm64, payload).data;
         encoder.imm64(imm64.decode());
     } else {
         const imm = emit.mir.instructions.items(.data)[inst].imm;
@@ -1001,7 +1008,7 @@ fn mirLeaRip(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
     const end_offset = emit.code.items.len;
     if (@truncate(u1, ops.flags) == 0b0) {
         const payload = emit.mir.instructions.items(.data)[inst].payload;
-        const imm = emit.mir.extraData(Mir.Imm64, payload).data.decode();
+        const imm = Mir.extraData(emit.mir.extra, Mir.Imm64, payload).data.decode();
         encoder.disp32(@intCast(i32, @intCast(i64, imm) - @intCast(i64, end_offset - start_offset + 4)));
     } else {
         const got_entry = emit.mir.instructions.items(.data)[inst].got_entry;
@@ -1056,7 +1063,7 @@ fn mirDbgLine(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
     const tag = emit.mir.instructions.items(.tag)[inst];
     assert(tag == .dbg_line);
     const payload = emit.mir.instructions.items(.data)[inst].payload;
-    const dbg_line_column = emit.mir.extraData(Mir.DbgLineColumn, payload).data;
+    const dbg_line_column = Mir.extraData(emit.mir.extra, Mir.DbgLineColumn, payload).data;
     try emit.dbgAdvancePCAndLine(dbg_line_column.line, dbg_line_column.column);
 }
 
@@ -1141,7 +1148,7 @@ fn mirArgDbgInfo(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
     const tag = emit.mir.instructions.items(.tag)[inst];
     assert(tag == .arg_dbg_info);
     const payload = emit.mir.instructions.items(.data)[inst].payload;
-    const arg_dbg_info = emit.mir.extraData(Mir.ArgDbgInfo, payload).data;
+    const arg_dbg_info = Mir.extraData(emit.mir.extra, Mir.ArgDbgInfo, payload).data;
     const mcv = emit.mir.function.args[arg_dbg_info.arg_index];
     try emit.genArgDbgInfo(arg_dbg_info.air_inst, mcv);
 }
@@ -1203,4 +1210,122 @@ fn addDbgInfoTypeReloc(emit: *Emit, ty: Type) !void {
         .plan9 => {},
         .none => {},
     }
+}
+
+const MirMock = struct {
+    const gpa = testing.allocator;
+
+    mir_instructions: std.MultiArrayList(Mir.Inst) = .{},
+    mir_extra: std.ArrayListUnmanaged(u32) = .{},
+    code: std.ArrayList(u8),
+
+    fn init() MirMock {
+        return .{
+            .code = std.ArrayList(u8).init(gpa),
+        };
+    }
+
+    fn deinit(self: *MirMock) void {
+        self.mir_instructions.deinit(gpa);
+        self.mir_extra.deinit(gpa);
+        self.code.deinit();
+    }
+
+    fn addInst(self: *MirMock, inst: Mir.Inst) error{OutOfMemory}!Mir.Inst.Index {
+        try self.mir_instructions.ensureUnusedCapacity(gpa, 1);
+        const result_index = @intCast(Air.Inst.Index, self.mir_instructions.len);
+        self.mir_instructions.appendAssumeCapacity(inst);
+        return result_index;
+    }
+
+    fn addExtra(self: *MirMock, extra: anytype) Allocator.Error!u32 {
+        const fields = std.meta.fields(@TypeOf(extra));
+        try self.mir_extra.ensureUnusedCapacity(gpa, fields.len);
+        return self.addExtraAssumeCapacity(extra);
+    }
+
+    fn addExtraAssumeCapacity(self: *MirMock, extra: anytype) u32 {
+        const fields = std.meta.fields(@TypeOf(extra));
+        const result = @intCast(u32, self.mir_extra.items.len);
+        inline for (fields) |field| {
+            self.mir_extra.appendAssumeCapacity(switch (field.field_type) {
+                u32 => @field(extra, field.name),
+                i32 => @bitCast(u32, @field(extra, field.name)),
+                else => @compileError("bad field type"),
+            });
+        }
+        return result;
+    }
+};
+
+test "mov dst_reg, src_reg" {
+    var mir_mock = MirMock.init();
+    defer mir_mock.deinit();
+
+    const index = try mir_mock.addInst(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .rbp,
+            .reg2 = .rsp,
+        }).encode(),
+        .data = undefined,
+    });
+    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
+    try testing.expect(mir_mock.code.items.len == 3);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x48, 0x89, 0xe5 }, mir_mock.code.items);
+}
+
+test "mov dst_reg, [src_reg + imm32]" {
+    var mir_mock = MirMock.init();
+    defer mir_mock.deinit();
+
+    const index = try mir_mock.addInst(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .r11,
+            .reg2 = .rbp,
+            .flags = 0b01,
+        }).encode(),
+        .data = .{ .imm = 0x10 },
+    });
+    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
+    try testing.expect(mir_mock.code.items.len == 4);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x4c, 0x8b, 0x5d, 0x10 }, mir_mock.code.items);
+}
+
+test "mov [dst_reg + imm32], src_reg" {
+    var mir_mock = MirMock.init();
+    defer mir_mock.deinit();
+
+    const index = try mir_mock.addInst(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .r11,
+            .reg2 = .rbp,
+            .flags = 0b10,
+        }).encode(),
+        .data = .{ .imm = 0x10 },
+    });
+    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
+    try testing.expect(mir_mock.code.items.len == 4);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x49, 0x89, 0x6b, 0x10 }, mir_mock.code.items);
+}
+
+test "mov dst_reg, [src_reg]" {
+    var mir_mock = MirMock.init();
+    defer mir_mock.deinit();
+
+    const index = try mir_mock.addInst(.{
+        .tag = .mov,
+        .ops = (Mir.Ops{
+            .reg1 = .r11,
+            .reg2 = .rbp,
+            .flags = 0b11,
+        }).encode(),
+        .data = undefined,
+    });
+    try mirArithImpl(mir_mock.mir_instructions.slice(), mir_mock.mir_extra.items, .mov, index, &mir_mock.code);
+    // try testing.expect(mir_mock.code.items.len == 4);
+    std.debug.print("{x}\n", .{std.fmt.fmtSliceHexLower(mir_mock.code.items)});
+    // try testing.expectEqualSlices(u8, &[_]u8{ 0x49, 0x89, 0x6b, 0x10 }, mir_mock.code.items);
 }
