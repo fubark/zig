@@ -1608,9 +1608,8 @@ fn genBinMathOpMir(
                     _ = try self.addInst(.{
                         .tag = mir_tag,
                         .ops = (Mir.Ops{
-                            .reg1 = src_reg,
-                            .reg2 = dst_reg,
-                            .flags = 0b11,
+                            .reg1 = dst_reg,
+                            .reg2 = src_reg,
                         }).encode(),
                         .data = undefined,
                     });

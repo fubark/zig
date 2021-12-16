@@ -706,15 +706,15 @@ fn mirArithImpl(
             const encoder = try Encoder.init(code, 7);
             encoder.rex(.{
                 .w = ops.reg2.size() == 64,
-                .r = ops.reg2.isExtended(),
-                .b = ops.reg1.isExtended(),
+                .r = ops.reg1.isExtended(),
+                .b = ops.reg2.isExtended(),
             });
             encoder.opcode_1byte(opc);
             if (imm <= math.maxInt(i8)) {
-                encoder.modRm_indirectDisp8(ops.reg2.lowId(), ops.reg1.lowId());
+                encoder.modRm_indirectDisp8(ops.reg1.lowId(), ops.reg2.lowId());
                 encoder.disp8(@intCast(i8, imm));
             } else {
-                encoder.modRm_indirectDisp32(ops.reg2.lowId(), ops.reg1.lowId());
+                encoder.modRm_indirectDisp32(ops.reg1.lowId(), ops.reg2.lowId());
                 encoder.disp32(imm);
             }
         },
@@ -952,15 +952,15 @@ fn mirMovImpl(
             const encoder = try Encoder.init(code, 7);
             encoder.rex(.{
                 .w = ops.reg2.size() == 64,
-                .r = ops.reg2.isExtended(),
-                .b = ops.reg1.isExtended(),
+                .r = ops.reg1.isExtended(),
+                .b = ops.reg2.isExtended(),
             });
             encoder.opcode_1byte(opc);
             if (imm <= math.maxInt(i8)) {
-                encoder.modRm_indirectDisp8(ops.reg2.lowId(), ops.reg1.lowId());
+                encoder.modRm_indirectDisp8(ops.reg1.lowId(), ops.reg2.lowId());
                 encoder.disp8(@intCast(i8, imm));
             } else {
-                encoder.modRm_indirectDisp32(ops.reg2.lowId(), ops.reg1.lowId());
+                encoder.modRm_indirectDisp32(ops.reg1.lowId(), ops.reg2.lowId());
                 encoder.disp32(imm);
             }
         },
